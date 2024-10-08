@@ -1,0 +1,11 @@
+[package]
+name = "fast-smr"
+version = "0.1.0"
+edition = "2021"
+description = "A fast and robust implementation of safe memory reclamation."
+homepage = "https://github.com/aarc-rs/"
+repository = "https://github.com/aarc-rs/fast-smr"
+license = "MIT"
+keywords = ["smr", "thread-safe", "sync", "lock-free"]
+categories = ["concurrency", "memory-management", "data-structures", "algorithms"]
+exclude = [".github/", ".gitignore", "target/"]

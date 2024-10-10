@@ -2,7 +2,7 @@
 name = "fast-smr"
 version = "0.1.0"
 edition = "2021"
-description = "A fast and robust implementation of safe memory reclamation."
+description = "Toward fast, wait-free, portable, and robust memory reclamation."
 homepage = "https://github.com/aarc-rs/"
 repository = "https://github.com/aarc-rs/fast-smr"
 license = "MIT"

@@ -149,7 +149,7 @@ pub struct ThreadContext<'a> {
 
 impl<'a> ThreadContext<'a> {
     pub fn load<T>(&self, src: &AtomicPtr<T>) -> Option<Guard<'_, 'a, T>> {
-        self.protect(&src, NonNull::new(src.load(SeqCst))?)
+        self.protect(src, NonNull::new(src.load(SeqCst))?)
     }
     pub fn protect<T>(&self, src: &AtomicPtr<T>, ptr: NonNull<T>) -> Option<Guard<'_, 'a, T>> {
         let mut counts = self.counts.borrow_mut();
@@ -191,6 +191,7 @@ impl<'a> ThreadContext<'a> {
         None
     }
 
+    #[allow(clippy::missing_safety_doc)]
     pub unsafe fn retire(&self, ptr: *mut u8, f: fn(*mut u8), birth_era: u64) {
         if self.cleanup_freq == 0 {
             panic!("cannot retire using this context: cleanup_freq is 0.")

@@ -208,6 +208,14 @@ impl<'r> ThreadContext<'r> {
         });
     }
 
+    pub fn increment_era(&self) {
+        self.reclaimer.era.fetch_add(1, SeqCst);
+    }
+
+    pub fn load_era(&self) -> u64 {
+        self.reclaimer.era.load(SeqCst)
+    }
+
     fn scan_and_cleanup(&self) {
         let mut limbo_list = self.limbo_list.borrow_mut();
         let mut intervals = self.intervals.borrow_mut();

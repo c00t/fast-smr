@@ -1,2 +1,2 @@
-pub mod ibr;
+pub mod smr;
 pub(crate) mod utils;

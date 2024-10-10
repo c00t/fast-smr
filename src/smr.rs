@@ -191,8 +191,7 @@ impl<'a> ThreadContext<'a> {
         None
     }
 
-    #[allow(clippy::missing_safety_doc)]
-    pub unsafe fn retire(&self, ptr: *mut u8, f: fn(*mut u8), birth_era: u64) {
+    pub fn retire(&self, ptr: NonNull<u8>, f: fn(NonNull<u8>), birth_era: u64) {
         if self.cleanup_freq == 0 {
             panic!("cannot retire using this context: cleanup_freq is 0.")
         }
@@ -356,8 +355,8 @@ impl<'a, 'b: 'a, T> Drop for Guard<'a, 'b, T> {
 }
 
 struct RetiredFn {
-    ptr: *mut u8,
-    f: fn(*mut u8),
+    ptr: NonNull<u8>,
+    f: fn(NonNull<u8>),
     span: (u64, u64),
 }
 
@@ -370,6 +369,7 @@ impl Drop for RetiredFn {
 #[cfg(test)]
 mod tests {
     use std::mem::zeroed;
+    use std::ptr::NonNull;
     use std::sync::atomic::Ordering::{Relaxed, SeqCst};
     use std::sync::atomic::{AtomicPtr, AtomicUsize};
     use std::thread;
@@ -410,13 +410,18 @@ mod tests {
                             birth_era: r.load_era(),
                         };
                         let swapped = x.swap(Box::into_raw(Box::new(obj)), SeqCst);
-                        if !swapped.is_null() {
+                        if let Some(to_retire) = NonNull::<u8>::new(swapped as *mut u8) {
                             unsafe {
                                 ctx.retire(
-                                    swapped as *mut u8,
+                                    to_retire,
                                     dealloc_boxed_ptr::<Obj<usize>>,
                                     (*swapped).birth_era,
                                 );
+                            }
+                        }
+                        if !swapped.is_null() {
+                            unsafe {
+
                             }
                         }
                         r.increment_era();
@@ -435,9 +440,9 @@ mod tests {
         }
     }
 
-    fn dealloc_boxed_ptr<T>(p: *mut u8) {
+    fn dealloc_boxed_ptr<T>(p: NonNull<u8>) {
         unsafe {
-            drop(Box::from_raw(p as *mut T));
+            drop(Box::from_raw(p.as_ptr() as *mut T));
         }
     }
 

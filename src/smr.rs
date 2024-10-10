@@ -419,11 +419,6 @@ mod tests {
                                 );
                             }
                         }
-                        if !swapped.is_null() {
-                            unsafe {
-
-                            }
-                        }
                         r.increment_era();
                     }
                 });

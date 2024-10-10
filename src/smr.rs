@@ -132,9 +132,9 @@ impl Slot {
     }
 }
 
-pub struct ThreadContext<'a> {
-    reclaimer: &'a Reclaimer,
-    slot: &'a Slot,
+pub struct ThreadContext<'r> {
+    reclaimer: &'r Reclaimer,
+    slot: &'r Slot,
     index: usize,
 
     limbo_list: RefCell<Vec<RetiredFn>>,
@@ -147,11 +147,11 @@ pub struct ThreadContext<'a> {
     intervals: RefCell<Vec<(u64, u64)>>,
 }
 
-impl<'a> ThreadContext<'a> {
-    pub fn load<T>(&self, src: &AtomicPtr<T>) -> Option<Guard<'_, 'a, T>> {
+impl<'r> ThreadContext<'r> {
+    pub fn load<T>(&self, src: &AtomicPtr<T>) -> Option<Guard<'_, 'r, T>> {
         self.protect(src, NonNull::new(src.load(SeqCst))?)
     }
-    pub fn protect<T>(&self, src: &AtomicPtr<T>, ptr: NonNull<T>) -> Option<Guard<'_, 'a, T>> {
+    pub fn protect<T>(&self, src: &AtomicPtr<T>, ptr: NonNull<T>) -> Option<Guard<'_, 'r, T>> {
         let mut counts = self.counts.borrow_mut();
         let mut initial_end_era = 0;
         let mut era = self.reclaimer.era.load(SeqCst);
@@ -264,7 +264,7 @@ fn intervals_overlap(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 <= b.1 && b.0 <= a.1
 }
 
-impl<'a> Drop for ThreadContext<'a> {
+impl<'r> Drop for ThreadContext<'r> {
     fn drop(&mut self) {
         debug_assert!(self.counts.borrow_mut().is_empty());
         self.scan_and_cleanup();
@@ -296,19 +296,19 @@ impl<'a> Drop for ThreadContext<'a> {
     }
 }
 
-pub struct Guard<'a, 'b: 'a, T> {
-    ctx: &'b ThreadContext<'a>,
+pub struct Guard<'c, 'r: 'c, T> {
+    ctx: &'c ThreadContext<'r>,
     era: u64,
     ptr: NonNull<T>,
 }
 
-impl<'a, 'b: 'a, T> Guard<'a, 'b, T> {
+impl<'c, 'r: 'c, T> Guard<'c, 'r, T> {
     pub fn as_ptr(&self) -> *mut T {
         self.ptr.as_ptr()
     }
 }
 
-impl<'a, 'b: 'a, T> Drop for Guard<'a, 'b, T> {
+impl<'c, 'r: 'c, T> Drop for Guard<'c, 'r, T> {
     fn drop(&mut self) {
         let mut counts = self.ctx.counts.borrow_mut();
 

@@ -1,82 +1,71 @@
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::cmp::max;
 use std::collections::VecDeque;
-use std::mem::zeroed;
+use std::mem::{take, zeroed};
+use std::num::NonZero;
 use std::ptr::NonNull;
 use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64};
+use std::thread::available_parallelism;
 
 use crate::utils::{Stack, ULL};
 
 const SLOTS_PER_NODE: usize = 8;
 
-pub struct Reclaimer {
+struct Reclaimer {
     slots: ULL<Slot, SLOTS_PER_NODE>,
-
-    // the global era value.
     era: AtomicU64,
 
     // limbo lists may be transferred here on drop.
     drop_cache: Stack<Vec<RetiredFn>>,
 }
 
-impl Reclaimer {
-    pub const fn new() -> Self {
-        Self {
-            slots: unsafe { zeroed() },
-            era: AtomicU64::new(1),
-            drop_cache: Stack::new(),
+pub fn join(cleanup_freq: usize) -> ThreadContext {
+    let mut node = &RECLAIMER.slots.head;
+    let mut index = 0;
+    // iterate until we successfully claim a slot, expanding the list as necessary.
+    loop {
+        if index > 0 && index % SLOTS_PER_NODE == 0 {
+            node = unsafe { node.get_or_init_next() };
+        }
+        if node.items[index % SLOTS_PER_NODE].try_claim() {
+            break;
+        }
+        index += 1;
+    }
+    // set len to max(len, index + 1).
+    let mut len = RECLAIMER.slots.len.load(SeqCst);
+    while index + 1 > len {
+        match RECLAIMER
+            .slots
+            .len
+            .compare_exchange(len, index + 1, SeqCst, SeqCst)
+        {
+            Ok(_) => break,
+            Err(l) => len = l,
         }
     }
-    pub fn join(&self, cleanup_freq: usize) -> ThreadContext<'_> {
-        let mut node = &self.slots.head;
-        let mut index = 0;
-        // iterate until we successfully claim a slot, expanding the list as necessary.
-        loop {
-            if index > 0 && index % SLOTS_PER_NODE == 0 {
-                node = unsafe { node.get_or_init_next() };
-            }
-            if node.items[index % SLOTS_PER_NODE].try_claim() {
-                break;
-            }
-            index += 1;
-        }
-        // set len to max(len, index + 1).
-        let mut len = self.slots.len.load(SeqCst);
-        while index + 1 > len {
-            match self
-                .slots
-                .len
-                .compare_exchange(len, index + 1, SeqCst, SeqCst)
-            {
-                Ok(_) => break,
-                Err(l) => len = l,
-            }
-        }
-        ThreadContext {
-            reclaimer: self,
-            slot: &node.items[index % SLOTS_PER_NODE],
-            index,
-            limbo_list: RefCell::new(self.drop_cache.take_all().into_iter().flatten().collect()),
-            cleanup_freq,
-            cleanup_counter: Cell::new(0),
-            counts: RefCell::default(),
-            intervals: RefCell::default(),
-        }
-    }
-    pub fn increment_era(&self) {
-        self.era.fetch_add(1, SeqCst);
-    }
-    pub fn load_era(&self) -> u64 {
-        self.era.load(SeqCst)
+    ThreadContext {
+        slot: &node.items[index % SLOTS_PER_NODE],
+        index,
+        limbo_list: RECLAIMER
+            .drop_cache
+            .take_all()
+            .into_iter()
+            .flatten()
+            .collect(),
+        cleanup_freq,
+        cleanup_counter: 0,
+        counts: VecDeque::default(),
+        intervals: Vec::default(),
     }
 }
 
-impl Default for Reclaimer {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+static RECLAIMER: Reclaimer = Reclaimer {
+    slots: unsafe { zeroed() },
+    era: AtomicU64::new(1),
+    drop_cache: Stack::new(),
+};
 
 /// See: https://docs.rs/crossbeam-utils/latest/src/crossbeam_utils/cache_padded.rs.html
 #[cfg_attr(
@@ -132,96 +121,88 @@ impl Slot {
     }
 }
 
-pub struct ThreadContext<'r> {
-    reclaimer: &'r Reclaimer,
-    slot: &'r Slot,
-    index: usize,
-
-    limbo_list: RefCell<Vec<RetiredFn>>,
-    cleanup_freq: usize,
-    cleanup_counter: Cell<usize>,
-
-    // a monotonically increasing queue consisting of (era, count) tuples.
-    counts: RefCell<VecDeque<(u64, usize)>>,
-    // a reusable Vec for storing hazardous intervals when scanning slots.
-    intervals: RefCell<Vec<(u64, u64)>>,
+thread_local! {
+    static CTX: RefCell<ThreadContext> = RefCell::new(join(available_parallelism().map_or(32, NonZero::get)));
 }
 
-impl<'r> ThreadContext<'r> {
-    pub fn load<T>(&self, src: &AtomicPtr<T>) -> Option<Guard<'_, 'r, T>> {
-        self.protect(src, NonNull::new(src.load(SeqCst))?)
-    }
-    pub fn protect<T>(&self, src: &AtomicPtr<T>, ptr: NonNull<T>) -> Option<Guard<'_, 'r, T>> {
-        let mut counts = self.counts.borrow_mut();
-        let mut initial_end_era = 0;
-        let mut era = self.reclaimer.era.load(SeqCst);
-        if let Some(back) = counts.back_mut() {
+pub struct ThreadContext {
+    slot: &'static Slot,
+    index: usize,
+
+    limbo_list: Vec<RetiredFn>,
+    cleanup_freq: usize,
+    cleanup_counter: usize,
+
+    // a monotonically increasing queue consisting of (era, count) tuples.
+    counts: VecDeque<(u64, usize)>,
+    // a reusable Vec for storing hazardous intervals when scanning slots.
+    intervals: Vec<(u64, u64)>,
+}
+
+pub fn load<T>(src: &AtomicPtr<T>) -> Option<Guard<T>> {
+    protect(src, NonNull::new(src.load(SeqCst))?)
+}
+
+pub fn protect<T>(src: &AtomicPtr<T>, ptr: NonNull<T>) -> Option<Guard<T>> {
+    let mut initial_end_era = 0;
+    let mut era = RECLAIMER.era.load(SeqCst);
+    CTX.with_borrow_mut(|ctx| {
+        if let Some(back) = ctx.counts.back_mut() {
             initial_end_era = back.0;
             if initial_end_era == era {
                 // the current era was already protected by a previous call to this method.
                 // simply increment the count of the last protected era.
                 back.1 += 1;
-                return Some(Guard {
-                    ctx: self,
-                    era,
-                    ptr,
-                });
+                return Some(Guard { era, ptr });
             }
         }
-        self.slot.end_era.store(era, SeqCst);
+        ctx.slot.end_era.store(era, SeqCst);
         while let Some(ptr) = NonNull::new(src.load(SeqCst)) {
-            let next_era = self.reclaimer.era.load(SeqCst);
+            let next_era = RECLAIMER.era.load(SeqCst);
             if era == next_era {
-                counts.push_back((era, 1));
-                if counts.len() == 1 {
+                ctx.counts.push_back((era, 1));
+                if ctx.counts.len() == 1 {
                     // this is our first reservation, so start_era must also be updated.
-                    self.slot.start_era.store(era, SeqCst);
+                    ctx.slot.start_era.store(era, SeqCst);
                 }
-                return Some(Guard {
-                    ctx: self,
-                    era,
-                    ptr,
-                });
+                return Some(Guard { era, ptr });
             }
             era = next_era;
-            self.slot.end_era.store(era, SeqCst);
+            ctx.slot.end_era.store(era, SeqCst);
         }
         // null ptrs don't need protection; reset end_era to what it was before.
-        self.slot.end_era.store(initial_end_era, SeqCst);
+        ctx.slot.end_era.store(initial_end_era, SeqCst);
         None
-    }
+    })
+}
 
-    pub fn retire(&self, ptr: NonNull<u8>, f: fn(NonNull<u8>), birth_era: u64) {
-        if self.cleanup_freq == 0 {
-            panic!("cannot retire using this context: cleanup_freq is 0.")
+pub fn retire(ptr: NonNull<u8>, f: fn(NonNull<u8>), birth_era: u64) {
+    CTX.with_borrow_mut(|ctx| {
+        ctx.cleanup_counter = (ctx.cleanup_counter + 1) % ctx.cleanup_freq;
+        if ctx.cleanup_counter == 0 {
+            ctx.scan_and_cleanup()
         }
-        self.cleanup_counter
-            .set((self.cleanup_counter.get() + 1) % self.cleanup_freq);
-        if self.cleanup_counter.get() == 0 {
-            self.scan_and_cleanup();
-        }
-        let retire_era = self.reclaimer.era.load(SeqCst);
-        self.limbo_list.borrow_mut().push(RetiredFn {
+        let retire_era = RECLAIMER.era.load(SeqCst);
+        ctx.limbo_list.push(RetiredFn {
             ptr,
             f,
             span: (birth_era, retire_era),
         });
-    }
+    });
+}
 
-    pub fn increment_era(&self) {
-        self.reclaimer.era.fetch_add(1, SeqCst);
-    }
+pub fn increment_era() {
+    RECLAIMER.era.fetch_add(1, SeqCst);
+}
 
-    pub fn load_era(&self) -> u64 {
-        self.reclaimer.era.load(SeqCst)
-    }
+pub fn load_era() -> u64 {
+    RECLAIMER.era.load(SeqCst)
+}
 
-    fn scan_and_cleanup(&self) {
-        let mut limbo_list = self.limbo_list.borrow_mut();
-        let mut intervals = self.intervals.borrow_mut();
-
+impl ThreadContext {
+    fn scan_and_cleanup(&mut self) {
         // scan the global array of reservations.
-        for slot in self.reclaimer.slots.into_iter() {
+        for slot in RECLAIMER.slots.into_iter() {
             let end = slot.end_era.load(SeqCst);
             if end == 0 {
                 // this thread has no reservations.
@@ -232,39 +213,40 @@ impl<'r> ThreadContext<'r> {
                 // this slot has one reservation, defined by end_era.
                 start = end;
             }
-            intervals.push((start, end));
+            self.intervals.push((start, end));
         }
 
         // merge the intervals.
-        if intervals.len() > 1 {
-            intervals.sort_unstable();
+        if self.intervals.len() > 1 {
+            self.intervals.sort_unstable();
             let mut i = 1;
-            for j in 1..intervals.len() {
-                let (start, end) = intervals[j];
+            for j in 1..self.intervals.len() {
+                let (start, end) = self.intervals[j];
                 // [(1, 2), (3, 4)] can be merged into [(1, 4)].
-                if start <= intervals[i - 1].1 + 1 {
-                    intervals[i - 1].1 = max(end, intervals[i - 1].1);
+                if start <= self.intervals[i - 1].1 + 1 {
+                    self.intervals[i - 1].1 = max(end, self.intervals[i - 1].1);
                 } else {
-                    intervals[i] = (start, end);
+                    self.intervals[i] = (start, end);
                     i += 1;
                 }
             }
-            intervals.truncate(i);
+            self.intervals.truncate(i);
         }
 
         // go through the limbo list and delete the entries without conflicts.
         let mut i = 0;
-        while i < limbo_list.len() {
-            let has_conflict = intervals
+        while i < self.limbo_list.len() {
+            let has_conflict = self
+                .intervals
                 .iter()
-                .any(|x| intervals_overlap(limbo_list[i].span, *x));
+                .any(|x| intervals_overlap(self.limbo_list[i].span, *x));
             if has_conflict {
                 i += 1;
             } else {
-                limbo_list.swap_remove(i);
+                self.limbo_list.swap_remove(i);
             }
         }
-        intervals.clear();
+        self.intervals.clear();
     }
 }
 
@@ -272,15 +254,14 @@ fn intervals_overlap(a: (u64, u64), b: (u64, u64)) -> bool {
     a.0 <= b.1 && b.0 <= a.1
 }
 
-impl<'r> Drop for ThreadContext<'r> {
+impl Drop for ThreadContext {
     fn drop(&mut self) {
-        debug_assert!(self.counts.borrow_mut().is_empty());
         self.scan_and_cleanup();
-        if self.limbo_list.borrow_mut().len() > 0 {
-            self.reclaimer.drop_cache.insert(self.limbo_list.take());
+        if !self.limbo_list.is_empty() {
+            RECLAIMER.drop_cache.insert(take(&mut self.limbo_list));
         }
 
-        let mut nodes = vec![&self.reclaimer.slots.head];
+        let mut nodes = vec![&RECLAIMER.slots.head];
         while let Some(next) = unsafe { nodes.last().unwrap().next.load(SeqCst).as_ref() } {
             nodes.push(next);
         }
@@ -290,8 +271,7 @@ impl<'r> Drop for ThreadContext<'r> {
             if i < self.index && !slot.try_claim() {
                 break;
             }
-            let succeeded = self
-                .reclaimer
+            let succeeded = RECLAIMER
                 .slots
                 .len
                 .compare_exchange(i + 1, i, SeqCst, SeqCst)
@@ -304,61 +284,56 @@ impl<'r> Drop for ThreadContext<'r> {
     }
 }
 
-pub struct Guard<'c, 'r: 'c, T> {
-    ctx: &'c ThreadContext<'r>,
+pub struct Guard<T> {
     era: u64,
     ptr: NonNull<T>,
 }
 
-impl<'c, 'r: 'c, T> Guard<'c, 'r, T> {
+impl<T> Guard<T> {
     pub fn as_ptr(&self) -> *mut T {
         self.ptr.as_ptr()
     }
 }
 
-impl<'c, 'r: 'c, T> Drop for Guard<'c, 'r, T> {
+impl<T> Drop for Guard<T> {
     fn drop(&mut self) {
-        let mut counts = self.ctx.counts.borrow_mut();
+        CTX.with_borrow_mut(|ctx| {
+            // decrement the count.
+            let pair = ctx.counts.iter_mut().find(|(e, _)| *e == self.era).unwrap();
+            pair.1 -= 1;
 
-        // decrement the count.
-        let pair = counts.iter_mut().find(|(e, _)| *e == self.era).unwrap();
-        pair.1 -= 1;
+            let mut start_era_changed = false;
+            let mut end_era_changed = false;
 
-        let mut start_era_changed = false;
-        let mut end_era_changed = false;
-
-        // pop from the front and back of the queue to shrink the interval.
-        while let Some((_, count)) = counts.front() {
-            if *count > 0 {
-                break;
+            // pop from the front and back of the queue to shrink the interval.
+            while let Some((_, count)) = ctx.counts.front() {
+                if *count > 0 {
+                    break;
+                }
+                ctx.counts.pop_front();
+                start_era_changed = true;
             }
-            counts.pop_front();
-            start_era_changed = true;
-        }
-        while let Some((_, count)) = counts.back() {
-            if *count > 0 {
-                break;
+            while let Some((_, count)) = ctx.counts.back() {
+                if *count > 0 {
+                    break;
+                }
+                ctx.counts.pop_back();
+                end_era_changed = true;
             }
-            counts.pop_back();
-            end_era_changed = true;
-        }
 
-        // update our interval.
-        if counts.is_empty() {
-            // we have no more reservations; zero out our interval.
-            self.ctx.slot.end_era.store(0, SeqCst);
-            self.ctx.slot.start_era.store(0, SeqCst);
-        } else if start_era_changed {
-            self.ctx
-                .slot
-                .start_era
-                .store(counts.front().unwrap().0, SeqCst);
-        } else if end_era_changed {
-            self.ctx
-                .slot
-                .end_era
-                .store(counts.back().unwrap().0, SeqCst);
-        }
+            // update our interval.
+            if ctx.counts.is_empty() {
+                // we have no more reservations; zero out our interval.
+                ctx.slot.end_era.store(0, SeqCst);
+                ctx.slot.start_era.store(0, SeqCst);
+            } else if start_era_changed {
+                ctx.slot
+                    .start_era
+                    .store(ctx.counts.front().unwrap().0, SeqCst);
+            } else if end_era_changed {
+                ctx.slot.end_era.store(ctx.counts.back().unwrap().0, SeqCst);
+            }
+        });
     }
 }
 
@@ -382,61 +357,62 @@ mod tests {
     use std::sync::atomic::{AtomicPtr, AtomicUsize};
     use std::thread;
 
-    use crate::smr::Reclaimer;
+    use crate::smr::{increment_era, load, load_era, retire};
+
+    #[test]
+    fn test_protect_retire_miri() {
+        test_protect_retire::<5, 30>();
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_protect_retire_no_miri() {
+        test_protect_retire::<64, 50>();
+    }
 
     struct Obj<T> {
         val: T,
         birth_era: u64,
     }
 
-    #[test]
-    fn test_protect_retire() {
-        const THREADS_COUNT: usize = 32;
-        const MAX_VAL: usize = 10;
-
-        let r = Reclaimer::new();
-
+    fn test_protect_retire<const THREADS: usize, const MAX_VAL: usize>() {
         let counts: [AtomicUsize; MAX_VAL] = unsafe { zeroed() };
-
         let x = AtomicPtr::new(Box::into_raw(Box::new(Obj {
             val: 0,
-            birth_era: r.load_era(),
+            birth_era: load_era(),
         })));
 
         thread::scope(|scope| {
-            for _ in 0..THREADS_COUNT {
+            for _ in 0..THREADS {
                 scope.spawn(|| {
-                    let ctx = r.join(1);
                     for val in 0..MAX_VAL {
-                        if let Some(guard) = ctx.load(&x) {
+                        if let Some(guard) = load(&x) {
                             unsafe {
                                 counts[(*guard.as_ptr()).val].fetch_add(1, Relaxed);
                             }
                         }
                         let obj = Obj {
                             val,
-                            birth_era: r.load_era(),
+                            birth_era: load_era(),
                         };
                         let swapped = x.swap(Box::into_raw(Box::new(obj)), SeqCst);
                         if let Some(to_retire) = NonNull::<u8>::new(swapped as *mut u8) {
                             unsafe {
-                                ctx.retire(
+                                retire(
                                     to_retire,
                                     dealloc_boxed_ptr::<Obj<usize>>,
                                     (*swapped).birth_era,
                                 );
                             }
                         }
-                        r.increment_era();
+                        increment_era();
                     }
                 });
             }
         });
 
-        assert_eq!(r.slots.len.load(Relaxed), 0);
-
         let total = counts.iter().fold(0, |x, y| x + y.load(Relaxed));
-        assert_eq!(total, THREADS_COUNT * MAX_VAL);
+        assert_eq!(total, THREADS * MAX_VAL);
 
         unsafe {
             drop(Box::from_raw(x.load(Relaxed)));
@@ -446,23 +422,6 @@ mod tests {
     fn dealloc_boxed_ptr<T>(p: NonNull<u8>) {
         unsafe {
             drop(Box::from_raw(p.as_ptr() as *mut T));
-        }
-    }
-
-    #[test]
-    fn test_reclaimer_join_leave() {
-        const TRIALS: usize = 10;
-        const THREADS_COUNT: usize = 10;
-
-        let r = Reclaimer::new();
-
-        for _ in 0..TRIALS {
-            thread::scope(|scope| {
-                for _ in 0..THREADS_COUNT {
-                    scope.spawn(|| drop(r.join(0)));
-                }
-            });
-            assert_eq!(r.slots.len.load(Relaxed), 0);
         }
     }
 }

@@ -48,16 +48,11 @@ pub fn join(cleanup_freq: usize) -> ThreadContext {
     ThreadContext {
         slot: &node.items[index % SLOTS_PER_NODE],
         index,
-        limbo_list: RECLAIMER
-            .drop_cache
-            .take_all()
-            .into_iter()
-            .flatten()
-            .collect(),
         cleanup_freq,
         cleanup_counter: 0,
         counts: VecDeque::default(),
         intervals: Vec::default(),
+        ready_to_drop: Vec::default(),
     }
 }
 
@@ -123,13 +118,36 @@ impl Slot {
 
 thread_local! {
     static CTX: RefCell<ThreadContext> = RefCell::new(join(available_parallelism().map_or(32, NonZero::get)));
+    static LIMBO_LIST: RefCell<LocalLimboList> = RefCell::new(LocalLimboList::new());
+}
+
+struct LocalLimboList(Vec<RetiredFn>);
+
+impl LocalLimboList {
+    fn new() -> Self {
+        Self(
+            RECLAIMER
+                .drop_cache
+                .take_all()
+                .into_iter()
+                .flatten()
+                .collect(),
+        )
+    }
+}
+
+impl Drop for LocalLimboList {
+    fn drop(&mut self) {
+        if !self.0.is_empty() {
+            RECLAIMER.drop_cache.insert(take(&mut self.0));
+        }
+    }
 }
 
 pub struct ThreadContext {
     slot: &'static Slot,
     index: usize,
 
-    limbo_list: Vec<RetiredFn>,
     cleanup_freq: usize,
     cleanup_counter: usize,
 
@@ -137,6 +155,8 @@ pub struct ThreadContext {
     counts: VecDeque<(u64, usize)>,
     // a reusable Vec for storing hazardous intervals when scanning slots.
     intervals: Vec<(u64, u64)>,
+    // a reusable Vec for storing items that are ready to be dropped.
+    ready_to_drop: Vec<RetiredFn>,
 }
 
 pub fn load<T>(src: &AtomicPtr<T>) -> Option<Guard<T>> {
@@ -177,18 +197,21 @@ pub fn protect<T>(src: &AtomicPtr<T>, ptr: NonNull<T>) -> Option<Guard<T>> {
 }
 
 pub fn retire(ptr: NonNull<u8>, f: fn(NonNull<u8>), birth_era: u64) {
-    CTX.with_borrow_mut(|ctx| {
-        ctx.cleanup_counter = (ctx.cleanup_counter + 1) % ctx.cleanup_freq;
-        if ctx.cleanup_counter == 0 {
-            ctx.scan_and_cleanup()
+    CTX.with(|ref_cell| {
+        if let Ok(mut ctx) = ref_cell.try_borrow_mut() {
+            ctx.cleanup_counter = (ctx.cleanup_counter + 1) % ctx.cleanup_freq;
+            if ctx.cleanup_counter == 0 {
+                ctx.scan_and_cleanup();
+            }
         }
-        let retire_era = RECLAIMER.era.load(SeqCst);
-        ctx.limbo_list.push(RetiredFn {
-            ptr,
-            f,
-            span: (birth_era, retire_era),
-        });
     });
+    let retire_era = RECLAIMER.era.load(SeqCst);
+    let r = RetiredFn {
+        ptr,
+        f,
+        span: (birth_era, retire_era),
+    };
+    LIMBO_LIST.with_borrow_mut(|list| list.0.push(r));
 }
 
 pub fn increment_era() {
@@ -233,19 +256,22 @@ impl ThreadContext {
             self.intervals.truncate(i);
         }
 
-        // go through the limbo list and delete the entries without conflicts.
-        let mut i = 0;
-        while i < self.limbo_list.len() {
-            let has_conflict = self
-                .intervals
-                .iter()
-                .any(|x| intervals_overlap(self.limbo_list[i].span, *x));
-            if has_conflict {
-                i += 1;
-            } else {
-                self.limbo_list.swap_remove(i);
+        LIMBO_LIST.with_borrow_mut(|list| {
+            // go through the limbo list and delete the entries without conflicts.
+            let mut i = 0;
+            while i < list.0.len() {
+                let has_conflict = self
+                    .intervals
+                    .iter()
+                    .any(|x| intervals_overlap(list.0[i].span, *x));
+                if has_conflict {
+                    i += 1;
+                } else {
+                    self.ready_to_drop.push(list.0.swap_remove(i));
+                }
             }
-        }
+        });
+        self.ready_to_drop.clear();
         self.intervals.clear();
     }
 }
@@ -256,11 +282,6 @@ fn intervals_overlap(a: (u64, u64), b: (u64, u64)) -> bool {
 
 impl Drop for ThreadContext {
     fn drop(&mut self) {
-        self.scan_and_cleanup();
-        if !self.limbo_list.is_empty() {
-            RECLAIMER.drop_cache.insert(take(&mut self.limbo_list));
-        }
-
         let mut nodes = vec![&RECLAIMER.slots.head];
         while let Some(next) = unsafe { nodes.last().unwrap().next.load(SeqCst).as_ref() } {
             nodes.push(next);

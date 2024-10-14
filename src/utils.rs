@@ -1,6 +1,6 @@
 use std::mem::{take, zeroed};
 use std::ptr::null_mut;
-use std::sync::atomic::Ordering::{Acquire, Relaxed, SeqCst};
+use std::sync::atomic::Ordering::{Relaxed, SeqCst};
 use std::sync::atomic::{AtomicPtr, AtomicUsize};
 
 // A specialized lock-free stack.
@@ -100,7 +100,7 @@ impl<T, const N: usize> ULLNode<T, N> {
 
 impl<T, const N: usize> Drop for ULLNode<T, N> {
     fn drop(&mut self) {
-        let next = self.next.load(Acquire);
+        let next = self.next.load(Relaxed);
         if !next.is_null() {
             unsafe {
                 drop(Box::from_raw(next));
@@ -117,7 +117,7 @@ impl<'a, T, const N: usize> IntoIterator for &'a ULL<T, N> {
         ULLIter {
             node: &self.head,
             index: 0,
-            len: self.len.load(Acquire),
+            len: self.len.load(SeqCst),
         }
     }
 }
@@ -136,7 +136,7 @@ impl<'a, T, const N: usize> Iterator for ULLIter<'a, T, N> {
             return None;
         }
         if self.index > 0 && self.index % N == 0 {
-            self.node = unsafe { &*self.node.next.load(Acquire) };
+            self.node = unsafe { &*self.node.next.load(SeqCst) };
         }
         let item = &self.node.items[self.index % N];
         self.index += 1;

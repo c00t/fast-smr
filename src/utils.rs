@@ -188,8 +188,10 @@ mod tests {
 
         // this test mimics the logic of updating the length of the ULL in Reclaimer.
 
-        static SLOTS: [AtomicBool; THREADS_COUNT] = unsafe { zeroed() };
-        static LEN: AtomicUsize = AtomicUsize::new(0);
+        dyntls::lazy_static! {
+            static ref SLOTS: [AtomicBool; THREADS_COUNT] = unsafe { zeroed() };
+            static ref LEN: AtomicUsize = AtomicUsize::new(0);
+        }
 
         let join = || {
             let mut index = 0;

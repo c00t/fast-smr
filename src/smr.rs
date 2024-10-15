@@ -56,11 +56,13 @@ pub fn join(cleanup_freq: usize) -> ThreadContext {
     }
 }
 
-static RECLAIMER: Reclaimer = Reclaimer {
-    slots: unsafe { zeroed() },
-    era: AtomicU64::new(1),
-    drop_cache: Stack::new(),
-};
+dyntls::lazy_static! {
+    static ref RECLAIMER: Reclaimer = Reclaimer {
+        slots: unsafe { zeroed() },
+        era: AtomicU64::new(1),
+        drop_cache: Stack::new(),
+    };
+}
 
 /// See: https://docs.rs/crossbeam-utils/latest/src/crossbeam_utils/cache_padded.rs.html
 #[cfg_attr(
@@ -116,7 +118,7 @@ impl Slot {
     }
 }
 
-thread_local! {
+dyntls::thread_local! {
     static CTX: RefCell<ThreadContext> = RefCell::new(join(available_parallelism().map_or(32, NonZero::get)));
     static LIMBO_LIST: RefCell<LocalLimboList> = RefCell::new(LocalLimboList::new());
 }

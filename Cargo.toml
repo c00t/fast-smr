@@ -14,4 +14,4 @@ exclude = [".github/", ".gitignore", "target/"]
 dyntls = { path = "../../../app/dyntls" }
 
 [dev-dependencies]
-dyntls = { path = "../../../app/dyntls" , features = ["host"]}
+dyntls-host = { path = "../../../app/dyntls_host"}
